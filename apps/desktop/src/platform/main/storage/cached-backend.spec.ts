@@ -1,28 +1,62 @@
 import { CachedBackend } from "./cached-backend";
-import { StorageBackend } from "./storage-backend";
+import { StoreFile } from "./storage-backend";
 
-function createMockBackend(initial: Record<string, unknown> = {}): StorageBackend {
+type Store = Record<string, unknown>;
+
+interface MockFile extends StoreFile {
+  read: jest.Mock<Store, []>;
+  write: jest.Mock<Promise<void>, [Readonly<Store>, ReadonlySet<string>]>;
+  writeSync: jest.Mock<void, [Readonly<Store>, ReadonlySet<string>]>;
+  /** What the file holds now. */
+  stored(): Store;
+}
+
+function createMockFile(initial: Store = {}): MockFile {
   let data = { ...initial };
   return {
     read: jest.fn(() => ({ ...data })),
-    update: jest.fn((updater: (store: Record<string, unknown>) => Record<string, unknown>) => {
-      data = updater(data);
+    write: jest.fn<Promise<void>, [Readonly<Store>, ReadonlySet<string>]>((store) => {
+      data = { ...store };
+      return Promise.resolve();
     }),
-    write: jest.fn((store: Record<string, unknown>) => {
-      data = store;
+    writeSync: jest.fn<void, [Readonly<Store>, ReadonlySet<string>]>((store) => {
+      data = { ...store };
     }),
-    flush: jest.fn(() => {}),
+    stored: () => data,
   };
 }
 
+function keys(...names: string[]): Set<string> {
+  return new Set(names);
+}
+
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (e: unknown) => void;
+}
+
+/** A write that completes when the test says so. */
+function deferred(): Deferred {
+  let resolve!: () => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("CachedBackend", () => {
-  let inner: StorageBackend;
+  let file: MockFile;
+  let onWriteError: jest.Mock<void, [unknown]>;
   let sut: CachedBackend;
 
   beforeEach(() => {
     jest.useFakeTimers();
-    inner = createMockBackend({ key1: "value1" });
-    sut = new CachedBackend(inner);
+    file = createMockFile({ key1: "value1" });
+    onWriteError = jest.fn();
+    sut = new CachedBackend(file, onWriteError);
   });
 
   afterEach(() => {
@@ -30,145 +64,316 @@ describe("CachedBackend", () => {
   });
 
   describe("read", () => {
-    it("should load data from inner backend during construction", () => {
-      expect(inner.read).toHaveBeenCalledTimes(1);
+    it("should load data from the file during construction", () => {
+      expect(file.read).toHaveBeenCalledTimes(1);
       expect(sut.read()).toEqual({ key1: "value1" });
     });
 
-    it("should return cached data on subsequent reads without calling inner backend again", () => {
+    it("should return cached data on subsequent reads without reading the file again", () => {
       sut.read();
       sut.read();
       sut.read();
 
-      expect(inner.read).toHaveBeenCalledTimes(1);
+      expect(file.read).toHaveBeenCalledTimes(1);
     });
 
-    it("should return updated data immediately without waiting for flush", () => {
-      sut.update((store) => ({ ...store, key1: "updated" }));
+    it("should return updated data immediately without waiting for the write", () => {
+      sut.set("key1", "updated");
 
       expect(sut.read()).toEqual({ key1: "updated" });
-      expect(inner.write).not.toHaveBeenCalled();
+      expect(file.write).not.toHaveBeenCalled();
     });
   });
 
-  describe("update", () => {
-    it("should flush to inner backend after debounce delay", async () => {
-      sut.update((store) => ({ ...store, key1: "updated" }));
+  describe("set", () => {
+    it("should write to the file after the debounce delay", async () => {
+      sut.set("key1", "updated");
 
-      expect(inner.write).not.toHaveBeenCalled();
+      expect(file.write).not.toHaveBeenCalled();
 
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.write).toHaveBeenCalledTimes(1);
+      expect(file.write).toHaveBeenCalledTimes(1);
+      expect(file.write).toHaveBeenCalledWith({ key1: "updated" }, keys("key1"));
     });
 
-    it("should coalesce rapid updates into a single flush", async () => {
-      sut.update((store) => ({ ...store, key1: "first" }));
+    it("should coalesce rapid changes into a single write", async () => {
+      sut.set("key1", "first");
       await jest.advanceTimersByTimeAsync(100);
 
-      sut.update((store) => ({ ...store, key1: "second" }));
+      sut.set("key1", "second");
       await jest.advanceTimersByTimeAsync(100);
 
-      sut.update((store) => ({ ...store, key1: "third" }));
+      sut.set("key2", "third");
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.write).toHaveBeenCalledTimes(1);
-      expect(inner.write).toHaveBeenCalledWith({ key1: "third" });
+      expect(file.write).toHaveBeenCalledTimes(1);
+      expect(file.write).toHaveBeenCalledWith(
+        { key1: "second", key2: "third" },
+        keys("key1", "key2"),
+      );
     });
 
-    it("should flush after max wait even with continuous updates", async () => {
+    it("should write after the max wait even with continuous changes", async () => {
       for (let i = 0; i < 50; i++) {
-        sut.update((store) => ({ ...store, iteration: i }));
+        sut.set("iteration", i);
         await jest.advanceTimersByTimeAsync(150);
       }
 
-      expect((inner.write as jest.Mock).mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect(file.write.mock.calls.length).toBeGreaterThanOrEqual(1);
     });
 
-    it("should reset debounce cycle after flush", async () => {
-      sut.update(() => ({ batch: 1 }));
+    it("should reset the debounce cycle after a write", async () => {
+      sut.set("batch", 1);
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.write).toHaveBeenCalledTimes(1);
+      expect(file.write).toHaveBeenCalledTimes(1);
 
-      sut.update(() => ({ batch: 2 }));
+      sut.set("batch", 2);
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.write).toHaveBeenCalledTimes(2);
+      expect(file.write).toHaveBeenCalledTimes(2);
     });
 
-    it("should apply sequential updates correctly", () => {
-      sut.update((store) => ({ ...store, a: 1 }));
-      sut.update((store) => ({ ...store, b: 2 }));
+    it("should pass only the keys changed since the previous write", async () => {
+      sut.set("a", 1);
+      sut.set("b", 2);
+      await jest.advanceTimersByTimeAsync(200);
+      sut.set("b", 3);
+      await jest.advanceTimersByTimeAsync(200);
+
+      expect(file.write).toHaveBeenNthCalledWith(1, { key1: "value1", a: 1, b: 2 }, keys("a", "b"));
+      expect(file.write).toHaveBeenNthCalledWith(2, { key1: "value1", a: 1, b: 3 }, keys("b"));
+    });
+
+    it("should pass a key again when the same object is set after being modified", async () => {
+      const value = { count: 1 };
+      sut.set("obj", value);
+      await jest.advanceTimersByTimeAsync(200);
+
+      value.count = 2;
+      sut.set("obj", value);
+      await jest.advanceTimersByTimeAsync(200);
+
+      expect(file.write).toHaveBeenNthCalledWith(
+        2,
+        { key1: "value1", obj: { count: 2 } },
+        keys("obj"),
+      );
+    });
+
+    it("should apply sequential changes correctly", () => {
+      sut.set("a", 1);
+      sut.set("b", 2);
 
       expect(sut.read().a).toBe(1);
       expect(sut.read().b).toBe(2);
     });
+
+    it("should not change a store that was read before", () => {
+      const before = sut.read();
+
+      sut.set("key1", "changed");
+
+      expect(before).toEqual({ key1: "value1" });
+    });
   });
 
-  describe("write", () => {
-    it("should replace the cached store and flush it after the debounce delay", async () => {
-      sut.write({ other: "value" });
+  describe("remove", () => {
+    it("should remove the key and write it as changed", async () => {
+      sut.remove("key1");
 
-      expect(sut.read()).toEqual({ other: "value" });
-      expect(inner.write).not.toHaveBeenCalled();
+      expect(sut.read()).toEqual({});
 
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.write).toHaveBeenCalledWith({ other: "value" });
+      expect(file.write).toHaveBeenCalledWith({}, keys("key1"));
     });
 
-    it("should not keep a reference to the object it was given", () => {
-      const store: Record<string, unknown> = { key1: "value" };
-      sut.write(store);
+    it("should write nothing for a key the store does not hold", async () => {
+      sut.remove("missing");
 
-      store.key1 = "changed";
+      await jest.advanceTimersByTimeAsync(5000);
 
-      expect(sut.read()).toEqual({ key1: "value" });
+      expect(file.write).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("a write in flight", () => {
+    let first: Deferred;
+
+    beforeEach(() => {
+      first = deferred();
+      file.write.mockReturnValueOnce(first.promise);
+    });
+
+    it("should run one write at a time and write later changes after it", async () => {
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+      expect(file.write).toHaveBeenCalledTimes(1);
+
+      sut.set("b", 2);
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(file.write).toHaveBeenCalledTimes(1);
+
+      first.resolve();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(file.write).toHaveBeenCalledTimes(2);
+      expect(file.write).toHaveBeenLastCalledWith({ key1: "value1", a: 1, b: 2 }, keys("b"));
+    });
+
+    it("should write nothing more when nothing changed while it ran", async () => {
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+
+      first.resolve();
+      await jest.advanceTimersByTimeAsync(5000);
+
+      expect(file.write).toHaveBeenCalledTimes(1);
+    });
+
+    it("should report a failed write and retry its changes on the next debounce", async () => {
+      const error = new Error("ENOSPC");
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+
+      first.reject(error);
+      await jest.advanceTimersByTimeAsync(200);
+
+      expect(onWriteError).toHaveBeenCalledWith(error);
+      expect(file.write).toHaveBeenCalledTimes(2);
+      expect(file.write).toHaveBeenLastCalledWith({ key1: "value1", a: 1 }, keys("a"));
+    });
+
+    it("should report a synchronously thrown write and retry it without throwing from the timer", async () => {
+      const error = new Error("serialize");
+      file.write.mockReset();
+      file.write.mockImplementationOnce(() => {
+        throw error;
+      });
+      file.write.mockResolvedValue(undefined);
+      sut.set("a", 1);
+
+      await jest.advanceTimersByTimeAsync(200);
+
+      expect(onWriteError).toHaveBeenCalledWith(error);
+      await jest.advanceTimersByTimeAsync(200);
+      expect(file.write).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not retry or log a rejected write superseded by flush", async () => {
+      const error = new Error("ENOSPC");
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+
+      sut.flush();
+      first.reject(error);
+      await jest.advanceTimersByTimeAsync(5000);
+
+      expect(file.writeSync).toHaveBeenCalledWith({ key1: "value1", a: 1 }, keys());
+      expect(onWriteError).not.toHaveBeenCalled();
+      expect(file.write).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it("restores the max-wait bound when it fired during a failed write", async () => {
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+      sut.set("b", 2);
+      await jest.advanceTimersByTimeAsync(5000);
+
+      first.reject(new Error("ENOSPC"));
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(jest.getTimerCount()).toBe(2);
+    });
+
+    it("should flush the changes a failed write held", async () => {
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+      first.reject(new Error("ENOSPC"));
+      await jest.advanceTimersByTimeAsync(0);
+
+      sut.flush();
+
+      expect(file.writeSync).toHaveBeenCalledWith({ key1: "value1", a: 1 }, keys("a"));
     });
   });
 
   describe("flush", () => {
-    it("should immediately persist pending data to inner backend", () => {
-      sut.update((store) => ({ ...store, key1: "pending" }));
+    it("should write pending changes before returning", () => {
+      sut.set("key1", "pending");
 
-      expect(inner.write).not.toHaveBeenCalled();
+      expect(file.write).not.toHaveBeenCalled();
 
       sut.flush();
 
-      expect(inner.write).toHaveBeenCalledTimes(1);
-      expect(inner.write).toHaveBeenCalledWith({ key1: "pending" });
+      expect(file.writeSync).toHaveBeenCalledTimes(1);
+      expect(file.writeSync).toHaveBeenCalledWith({ key1: "pending" }, keys("key1"));
+      expect(file.stored()).toEqual({ key1: "pending" });
     });
 
-    it("should write the cached store without reading the inner backend again", () => {
-      sut.update((store) => ({ ...store, key1: "pending" }));
+    it("should write the cached store without reading the file again", () => {
+      sut.set("key1", "pending");
       sut.flush();
 
-      expect(inner.read).toHaveBeenCalledTimes(1);
-      expect(inner.update).not.toHaveBeenCalled();
+      expect(file.read).toHaveBeenCalledTimes(1);
     });
 
     it("should be a no-op when there are no pending changes", () => {
       sut.flush();
 
-      expect(inner.write).not.toHaveBeenCalled();
+      expect(file.writeSync).not.toHaveBeenCalled();
     });
 
     it("should only write once when flush is called twice sequentially", () => {
-      sut.update((store) => ({ ...store, key1: "value" }));
+      sut.set("key1", "value");
       sut.flush();
       sut.flush();
 
-      expect(inner.write).toHaveBeenCalledTimes(1);
+      expect(file.writeSync).toHaveBeenCalledTimes(1);
     });
 
-    it("should not double-flush if debounce timer fires after explicit flush", async () => {
-      sut.update((store) => ({ ...store, key1: "value" }));
+    it("should not write again if the debounce timer fires after an explicit flush", async () => {
+      sut.set("key1", "value");
       sut.flush();
 
       await jest.advanceTimersByTimeAsync(5000);
 
-      expect(inner.write).toHaveBeenCalledTimes(1);
+      expect(file.writeSync).toHaveBeenCalledTimes(1);
+      expect(file.write).not.toHaveBeenCalled();
+    });
+
+    it("should write before returning while a background write is in flight", async () => {
+      const inFlight = deferred();
+      file.write.mockReturnValueOnce(inFlight.promise);
+      sut.set("a", 1);
+      await jest.advanceTimersByTimeAsync(200);
+
+      sut.flush();
+
+      expect(file.writeSync).toHaveBeenCalledWith({ key1: "value1", a: 1 }, keys());
+
+      inFlight.resolve();
+      await jest.advanceTimersByTimeAsync(5000);
+
+      expect(file.write).toHaveBeenCalledTimes(1);
+      expect(file.writeSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("should keep the changes when the write fails, and write them with the next flush", () => {
+      sut.set("key1", "value");
+      file.writeSync.mockImplementationOnce(() => {
+        throw new Error("ENOSPC");
+      });
+
+      expect(() => sut.flush()).toThrow("ENOSPC");
+
+      sut.flush();
+
+      expect(file.writeSync).toHaveBeenCalledTimes(2);
+      expect(file.writeSync).toHaveBeenLastCalledWith({ key1: "value" }, keys("key1"));
     });
   });
 });

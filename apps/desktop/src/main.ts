@@ -154,7 +154,12 @@ export class Main {
       });
     }
 
-    const storageBackend = new CachedBackend(new JsonFileBackend(app.getPath("userData")));
+    // The log service is created below, after the store has been read; a background write
+    // can only fail after that.
+    const storageBackend = new CachedBackend(
+      new JsonFileBackend(app.getPath("userData")),
+      (error) => this.logService.error("Writing data.json failed", error),
+    );
 
     // Main has no ConfigService, so it reads the cached server configs straight from the store.
     let flightRecorderEnabled = false;
