@@ -388,9 +388,6 @@ module.exports.buildConfig = function buildConfig(params) {
         filename: "index.html",
         chunks: ["app/vendor", "app/main"],
       }),
-      new webpack.SourceMapDevToolPlugin({
-        include: ["app/main.js"],
-      }),
       new MiniCssExtractPlugin({
         filename: "[name].[contenthash].css",
         chunkFilename: "[id].[contenthash].css",
