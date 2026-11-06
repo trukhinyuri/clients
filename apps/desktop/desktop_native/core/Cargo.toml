@@ -29,7 +29,7 @@ interprocess = { workspace = true, features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "sync", "macros"] }
+tokio = { workspace = true, features = ["io-util", "sync", "macros", "rt"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
 
