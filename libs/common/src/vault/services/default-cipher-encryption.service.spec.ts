@@ -1,5 +1,5 @@
 import { mock } from "jest-mock-extended";
-import { of } from "rxjs";
+import { Subject, of } from "rxjs";
 
 // eslint-disable-next-line no-restricted-imports
 import { SymmetricCryptoKey } from "@bitwarden/legacy-crypto";
@@ -11,11 +11,13 @@ import {
   CipherListView,
   AttachmentView as SdkAttachmentView,
   Fido2CredentialFullView,
+  PasswordManagerClient,
 } from "@bitwarden/sdk-internal";
 
 import { UriMatchStrategy } from "../../models/domain/domain-service";
 import { LogService } from "../../platform/abstractions/log.service";
 import { SdkService } from "../../platform/abstractions/sdk/sdk.service";
+import { Rc } from "../../platform/misc/reference-counting/rc";
 import { Utils } from "../../platform/misc/utils";
 import { UserId, CipherId, OrganizationId } from "../../types/guid";
 import { UserKey } from "../../types/key";
@@ -676,6 +678,105 @@ describe("DefaultCipherEncryptionService", () => {
       await expect(
         cipherEncryptionService.decryptManyWithFailures(ciphers, userId),
       ).rejects.toThrow(batchError);
+      expect(mockRef[Symbol.dispose]).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects immediately when passed an already-aborted signal without taking an SDK reference", async () => {
+      const ciphers = [new Cipher({ ...cipherData, id: cipher1_id as CipherId })];
+      const controller = new AbortController();
+      const abortReason = new DOMException("Already locked", "AbortError");
+      controller.abort(abortReason);
+
+      await expect(
+        cipherEncryptionService.decryptManyWithFailures(ciphers, userId, controller.signal),
+      ).rejects.toBe(abortReason);
+
+      expect(sdkService.userClient$).not.toHaveBeenCalled();
+      expect(mockSdk.take).not.toHaveBeenCalled();
+      expect(mockSdkClient.vault().ciphers().decrypt_list_with_failures).not.toHaveBeenCalled();
+    });
+
+    it("aborts while waiting for userClient$ before an SDK client is emitted", async () => {
+      const clientSubject = new Subject<Rc<PasswordManagerClient>>();
+      sdkService.userClient$.mockImplementation(() => clientSubject.asObservable());
+      const ciphers = [new Cipher({ ...cipherData, id: cipher1_id as CipherId })];
+      const controller = new AbortController();
+      const abortReason = new DOMException("Aborted before client ready", "AbortError");
+
+      const promise = cipherEncryptionService.decryptManyWithFailures(
+        ciphers,
+        userId,
+        controller.signal,
+      );
+      controller.abort(abortReason);
+
+      await expect(promise).rejects.toBe(abortReason);
+      expect(clientSubject.observed).toBe(false);
+      expect(mockSdk.take).not.toHaveBeenCalled();
+    });
+
+    it("aborts in an interleaved macrotask between batches, stops remaining batches, and frees a disposed Rc client", async () => {
+      const free = jest.fn();
+      const rc = new Rc({
+        ...mockSdkClient,
+        free,
+      } as unknown as PasswordManagerClient);
+      sdkService.userClient$.mockImplementation(() => of(rc));
+
+      const ciphers = Array.from(
+        { length: 600 },
+        (_, i) => ({ toSdkCipher: () => ({ id: `${i}` }) }) as unknown as Cipher,
+      );
+      const controller = new AbortController();
+      const abortReason = new DOMException("Vault locked mid-decrypt", "AbortError");
+      const events: string[] = [];
+
+      mockSdkClient
+        .vault()
+        .ciphers()
+        .decrypt_list_with_failures.mockImplementation(async (batch: SdkCipher[]) => {
+          events.push(`batch:${batch[0].id}`);
+          setTimeout(() => {
+            events.push("lock:markForDisposal");
+            rc.markForDisposal();
+            expect(free).not.toHaveBeenCalled();
+            events.push("lock:abort");
+            controller.abort(abortReason);
+          }, 0);
+          return {
+            successes: batch.map((c) => ({ id: c.id }) as unknown as CipherListView),
+            failures: [] as SdkCipher[],
+          };
+        });
+
+      await expect(
+        cipherEncryptionService.decryptManyWithFailures(ciphers, userId, controller.signal),
+      ).rejects.toBe(abortReason);
+
+      expect(events).toEqual(["batch:0", "lock:markForDisposal", "lock:abort"]);
+      expect(mockSdkClient.vault().ciphers().decrypt_list_with_failures).toHaveBeenCalledTimes(1);
+      expect(free).toHaveBeenCalledTimes(1);
+    });
+
+    it("aborts before publishing if the signal aborts while a single batch is resolving", async () => {
+      const ciphers = [new Cipher({ ...cipherData, id: cipher1_id as CipherId })];
+      const controller = new AbortController();
+      const abortReason = new DOMException("Cleared before publish", "AbortError");
+
+      mockSdkClient
+        .vault()
+        .ciphers()
+        .decrypt_list_with_failures.mockImplementation(async () => {
+          controller.abort(abortReason);
+          return {
+            successes: [{ id: cipher1_id, name: "Plaintext" } as unknown as CipherListView],
+            failures: [] as SdkCipher[],
+          };
+        });
+
+      await expect(
+        cipherEncryptionService.decryptManyWithFailures(ciphers, userId, controller.signal),
+      ).rejects.toBe(abortReason);
       expect(mockRef[Symbol.dispose]).toHaveBeenCalledTimes(1);
     });
   });

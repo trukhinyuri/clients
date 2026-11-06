@@ -88,6 +88,7 @@ export abstract class CipherEncryptionService {
    *
    * @param ciphers The encrypted cipher objects
    * @param userId The user ID whose key will be used for decryption
+   * @param signal Optional abort signal to cancel in-flight batch decryption
    *
    * @returns A promise that resolves to a tuple containing an array of decrypted
    * cipher list views, and an array of ciphers that failed to decrypt.
@@ -95,6 +96,7 @@ export abstract class CipherEncryptionService {
   abstract decryptManyWithFailures(
     ciphers: Cipher[],
     userId: UserId,
+    signal?: AbortSignal,
   ): Promise<[CipherListView[], Cipher[]]>;
   /**
    * Decrypts an attachment's content from a response object.
