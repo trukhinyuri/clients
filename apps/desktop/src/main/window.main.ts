@@ -51,6 +51,21 @@ const mainWindowSizeKey = "mainWindowSize";
 const WindowEventHandlingDelay = 100;
 
 /**
+ * Delays after a window is shown at which Linux schedules a full repaint.
+ *
+ * Chromium's Wayland backend acks the compositor's first configure of a re-created
+ * xdg_toplevel only after the GPU presents a frame for the state that configure applies.
+ * When the configure changes only the window state (Hyprland reports every mapped window
+ * as maximized but configures the re-created toplevel as not maximized) and arrives while
+ * the first frame after show() is in flight, Chromium discards that frame as unconfigured
+ * while the GPU process treats it as presented. The frame for the new state then has no
+ * damage and is never drawn: the window never maps, and every later show() is a no-op
+ * (https://github.com/bitwarden/clients/issues/23899). Any repaint produces the frame
+ * Chromium waits for; a window that already mapped only redraws once per delay.
+ */
+const RepaintAfterShowDelaysMs = [100, 500, 1500];
+
+/**
  * Every path prefix a Bitwarden snap's real binary can sit under — one per snap name per snapd
  * mount root, e.g. `/snap/bitwarden/` and `/var/lib/snapd/snap/bitwarden-beta/`. See
  * {@link SNAP_MOUNT_DIRS} for why there is more than one root.
@@ -350,6 +365,25 @@ export class WindowMain {
     });
   }
 
+  /**
+   * Works around a Chromium Wayland deadlock that can leave a re-shown window unmapped.
+   * See {@link RepaintAfterShowDelaysMs}. Runs on the window's `show` event, which Electron
+   * emits from every `show()` on Linux, so no caller has to remember it.
+   */
+  private repaintAfterShow(win: BrowserWindow) {
+    if (!isLinux()) {
+      return;
+    }
+
+    for (const delay of RepaintAfterShowDelaysMs) {
+      setTimeout(() => {
+        if (!win.isDestroyed() && win.isVisible()) {
+          win.webContents.invalidate();
+        }
+      }, delay);
+    }
+  }
+
   private getWindowUrl(partial: Partial<url.UrlObject> = {}): string {
     // TODO(PM-33211): The custom file scheme only works on servers that support it for CORS (>=2026.3.0).
     // We have it disabled by default until self-hosted users are updated to maintain compatibility.
@@ -590,6 +624,9 @@ export class WindowMain {
         command: "windowIsFocused",
         windowIsFocused: true,
       });
+    });
+    win.on("show", () => {
+      this.repaintAfterShow(win);
     });
 
     win.webContents.setWindowOpenHandler(({ url }) => {
