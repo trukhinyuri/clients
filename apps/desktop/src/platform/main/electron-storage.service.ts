@@ -21,6 +21,11 @@ interface SaveOptions extends BaseOptions<"save"> {
 
 type Options = BaseOptions<"get"> | BaseOptions<"has"> | SaveOptions | BaseOptions<"remove">;
 
+function cloneForMainProcess<T>(value: T): T {
+  const json = JSON.stringify(value);
+  return json === undefined ? (undefined as T) : (JSON.parse(json) as T);
+}
+
 export class ElectronStorageService implements AbstractStorageService {
   private updatesSubject = new Subject<StorageUpdate>();
   updates$;
@@ -31,11 +36,13 @@ export class ElectronStorageService implements AbstractStorageService {
     ipcMain.handle("storageService", (event, options: Options) => {
       switch (options.action) {
         case "get":
-          return this.get(options.key);
+          // Electron structured-clones IPC responses, so avoid cloning a large vault twice.
+          return this.getValue(options.key);
         case "has":
           return this.has(options.key);
         case "save":
-          return this.save(options.key, options.obj);
+          // Electron structured-clones IPC requests before this handler runs.
+          return this.saveFromIpc(options.key, options.obj);
         case "remove":
           return this.remove(options.key);
       }
@@ -51,8 +58,9 @@ export class ElectronStorageService implements AbstractStorageService {
   }
 
   get<T>(key: string): Promise<T> {
-    const val = this.backend.read()[key] as T;
-    return Promise.resolve(val != null ? val : null);
+    // Main-process callers can otherwise mutate an object held by CachedBackend without marking
+    // the key dirty, leaving its cached serialized fragment stale.
+    return Promise.resolve(cloneForMainProcess(this.getValue<T>(key)));
   }
 
   has(key: string): Promise<boolean> {
@@ -64,22 +72,37 @@ export class ElectronStorageService implements AbstractStorageService {
     if (obj === undefined) {
       return this.remove(key);
     }
+    if (obj instanceof Set) {
+      obj = Array.from(obj);
+    }
+    return this.saveValue(key, cloneForMainProcess(obj));
+  }
+
+  private getValue<T>(key: string): T | null {
+    const value = this.backend.read()[key] as T;
+    return value != null ? value : null;
+  }
+
+  private saveFromIpc(key: string, obj: unknown): Promise<void> {
+    return this.saveValue(key, obj);
+  }
+
+  private saveValue(key: string, obj: unknown): Promise<void> {
+    if (obj === undefined) {
+      return this.remove(key);
+    }
 
     if (obj instanceof Set) {
       obj = Array.from(obj);
     }
 
-    this.backend.update((store) => ({ ...store, [key]: obj }));
+    this.backend.set(key, obj);
     this.updatesSubject.next({ key, updateType: "save" });
     return Promise.resolve();
   }
 
   remove(key: string): Promise<void> {
-    this.backend.update((store) => {
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { [key]: _, ...rest } = store;
-      return rest;
-    });
+    this.backend.remove(key);
     this.updatesSubject.next({ key, updateType: "remove" });
     return Promise.resolve();
   }

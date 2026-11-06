@@ -73,7 +73,7 @@ import { ElectronStorageService } from "./platform/main/electron-storage.service
 import { MainSdkService } from "./platform/main/main-sdk.service";
 import { SafeShell } from "./platform/main/safe-shell.main";
 import { CachedBackend } from "./platform/main/storage/cached-backend";
-import { ElectronStoreBackend } from "./platform/main/storage/electron-store-backend";
+import { JsonFileBackend } from "./platform/main/storage/json-file-backend";
 import { VersionMain } from "./platform/main/version.main";
 import { DesktopSettingsService } from "./platform/services/desktop-settings.service";
 import { ElectronLogMainService } from "./platform/services/electron-log.main.service";
@@ -154,7 +154,12 @@ export class Main {
       });
     }
 
-    const storageBackend = new CachedBackend(new ElectronStoreBackend(app.getPath("userData")));
+    // The log service is created below, after the store has been read; a background write
+    // can only fail after that.
+    const storageBackend = new CachedBackend(
+      new JsonFileBackend(app.getPath("userData")),
+      (error) => this.logService.error("Writing data.json failed", error),
+    );
 
     // Main has no ConfigService, so it reads the cached server configs straight from the store.
     let flightRecorderEnabled = false;

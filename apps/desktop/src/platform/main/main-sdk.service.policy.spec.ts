@@ -73,8 +73,14 @@ class InMemoryBackend implements StorageBackend {
     return this.store;
   }
 
-  update(updater: (store: Record<string, unknown>) => Record<string, unknown>): void {
-    this.store = updater(this.store);
+  set(key: string, value: unknown): void {
+    this.store = { ...this.store, [key]: value };
+  }
+
+  remove(key: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { [key]: _, ...rest } = this.store;
+    this.store = rest;
   }
 
   flush(): void {}
@@ -408,5 +414,48 @@ describe("PolicyService in the desktop main process", () => {
       [autotypePolicy(organizationId, false)],
     );
     expect(await nextMatching(applies$, false)).toBe(false);
+  });
+});
+
+describe("ElectronStorageService in the main process", () => {
+  it("isolates cached objects from in-process callers that mutate them", async () => {
+    const backend = new InMemoryBackend();
+    const storage = new ElectronStorageService(backend);
+    const windowState = { width: 800, height: 600, nested: { zoomFactor: 1 } };
+
+    await storage.save("global_desktopSettings_window", windowState);
+    windowState.width = 1024;
+    windowState.nested.zoomFactor = 2;
+
+    const state = await storage.get<typeof windowState>("global_desktopSettings_window");
+    state.height = 768;
+    state.nested.zoomFactor = 3;
+
+    expect(backend.read()).toEqual({
+      global_desktopSettings_window: { width: 800, height: 600, nested: { zoomFactor: 1 } },
+    });
+  });
+
+  it("normalizes Sets and preserves JSON serialization semantics for main-process saves", async () => {
+    class SerializedValue {
+      raw = "do not persist";
+
+      toJSON() {
+        return { serialized: true };
+      }
+    }
+
+    const backend = new InMemoryBackend();
+    const storage = new ElectronStorageService(backend);
+
+    await storage.save("set", new Set([1, 2]));
+    await storage.save("value", new SerializedValue());
+    await storage.save("object", { kept: true, omitted: () => undefined });
+
+    expect(backend.read()).toEqual({
+      set: [1, 2],
+      value: { serialized: true },
+      object: { kept: true },
+    });
   });
 });
