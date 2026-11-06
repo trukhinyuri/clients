@@ -8,6 +8,8 @@ export interface StorageBackend {
   read(): Record<string, unknown>;
   /** Update the store with the provided function, which receives the current store and returns the updated store. */
   update(updater: (store: Record<string, unknown>) => Record<string, unknown>): void;
+  /** Replace the entire store, without reading what it holds now. */
+  write(store: Record<string, unknown>): void;
   /** Persist any pending changes immediately. No-op if nothing is pending. */
   flush(): void;
 }

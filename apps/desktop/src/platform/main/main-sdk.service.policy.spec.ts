@@ -77,6 +77,10 @@ class InMemoryBackend implements StorageBackend {
     this.store = updater(this.store);
   }
 
+  write(store: Record<string, unknown>): void {
+    this.store = store;
+  }
+
   flush(): void {}
 }
 

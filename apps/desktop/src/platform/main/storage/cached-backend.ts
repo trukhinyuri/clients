@@ -28,7 +28,11 @@ export class CachedBackend implements StorageBackend {
   }
 
   update(updater: (store: Record<string, unknown>) => Record<string, unknown>): void {
-    this.cache = updater({ ...this.cache });
+    this.write(updater({ ...this.cache }));
+  }
+
+  write(store: Record<string, unknown>): void {
+    this.cache = { ...store };
     this.dirty = true;
     this.scheduleFlush();
   }
@@ -36,8 +40,7 @@ export class CachedBackend implements StorageBackend {
   flush(): void {
     this.clearTimers();
     if (this.dirty) {
-      const snapshot = { ...this.cache };
-      this.inner.update(() => snapshot);
+      this.inner.write({ ...this.cache });
       this.dirty = false;
     }
   }

@@ -8,6 +8,9 @@ function createMockBackend(initial: Record<string, unknown> = {}): StorageBacken
     update: jest.fn((updater: (store: Record<string, unknown>) => Record<string, unknown>) => {
       data = updater(data);
     }),
+    write: jest.fn((store: Record<string, unknown>) => {
+      data = store;
+    }),
     flush: jest.fn(() => {}),
   };
 }
@@ -44,7 +47,7 @@ describe("CachedBackend", () => {
       sut.update((store) => ({ ...store, key1: "updated" }));
 
       expect(sut.read()).toEqual({ key1: "updated" });
-      expect(inner.update).not.toHaveBeenCalled();
+      expect(inner.write).not.toHaveBeenCalled();
     });
   });
 
@@ -52,11 +55,11 @@ describe("CachedBackend", () => {
     it("should flush to inner backend after debounce delay", async () => {
       sut.update((store) => ({ ...store, key1: "updated" }));
 
-      expect(inner.update).not.toHaveBeenCalled();
+      expect(inner.write).not.toHaveBeenCalled();
 
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.update).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledTimes(1);
     });
 
     it("should coalesce rapid updates into a single flush", async () => {
@@ -69,7 +72,8 @@ describe("CachedBackend", () => {
       sut.update((store) => ({ ...store, key1: "third" }));
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.update).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledWith({ key1: "third" });
     });
 
     it("should flush after max wait even with continuous updates", async () => {
@@ -78,19 +82,19 @@ describe("CachedBackend", () => {
         await jest.advanceTimersByTimeAsync(150);
       }
 
-      expect((inner.update as jest.Mock).mock.calls.length).toBeGreaterThanOrEqual(1);
+      expect((inner.write as jest.Mock).mock.calls.length).toBeGreaterThanOrEqual(1);
     });
 
     it("should reset debounce cycle after flush", async () => {
       sut.update(() => ({ batch: 1 }));
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.update).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledTimes(1);
 
       sut.update(() => ({ batch: 2 }));
       await jest.advanceTimersByTimeAsync(200);
 
-      expect(inner.update).toHaveBeenCalledTimes(2);
+      expect(inner.write).toHaveBeenCalledTimes(2);
     });
 
     it("should apply sequential updates correctly", () => {
@@ -102,21 +106,52 @@ describe("CachedBackend", () => {
     });
   });
 
+  describe("write", () => {
+    it("should replace the cached store and flush it after the debounce delay", async () => {
+      sut.write({ other: "value" });
+
+      expect(sut.read()).toEqual({ other: "value" });
+      expect(inner.write).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(200);
+
+      expect(inner.write).toHaveBeenCalledWith({ other: "value" });
+    });
+
+    it("should not keep a reference to the object it was given", () => {
+      const store: Record<string, unknown> = { key1: "value" };
+      sut.write(store);
+
+      store.key1 = "changed";
+
+      expect(sut.read()).toEqual({ key1: "value" });
+    });
+  });
+
   describe("flush", () => {
     it("should immediately persist pending data to inner backend", () => {
       sut.update((store) => ({ ...store, key1: "pending" }));
 
-      expect(inner.update).not.toHaveBeenCalled();
+      expect(inner.write).not.toHaveBeenCalled();
 
       sut.flush();
 
-      expect(inner.update).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledWith({ key1: "pending" });
+    });
+
+    it("should write the cached store without reading the inner backend again", () => {
+      sut.update((store) => ({ ...store, key1: "pending" }));
+      sut.flush();
+
+      expect(inner.read).toHaveBeenCalledTimes(1);
+      expect(inner.update).not.toHaveBeenCalled();
     });
 
     it("should be a no-op when there are no pending changes", () => {
       sut.flush();
 
-      expect(inner.update).not.toHaveBeenCalled();
+      expect(inner.write).not.toHaveBeenCalled();
     });
 
     it("should only write once when flush is called twice sequentially", () => {
@@ -124,7 +159,7 @@ describe("CachedBackend", () => {
       sut.flush();
       sut.flush();
 
-      expect(inner.update).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledTimes(1);
     });
 
     it("should not double-flush if debounce timer fires after explicit flush", async () => {
@@ -133,7 +168,7 @@ describe("CachedBackend", () => {
 
       await jest.advanceTimersByTimeAsync(5000);
 
-      expect(inner.update).toHaveBeenCalledTimes(1);
+      expect(inner.write).toHaveBeenCalledTimes(1);
     });
   });
 });
