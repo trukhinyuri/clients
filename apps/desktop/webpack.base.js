@@ -91,8 +91,14 @@ module.exports.buildConfig = function buildConfig(params) {
     ...(isLocalLinkedSdk ? { watchOptions: { poll: 1000 } } : {}),
   };
 
-  const getOutputConfig = (isDev) => ({
+  // Main, preload and renderer all write to the same directory, and a module they share gets the
+  // same chunk id in each of them, and in development the same .wasm file name too. Prefix the
+  // chunk and .wasm files with the config name so one config cannot overwrite another's (e.g. the
+  // SDK .wasm and its chunks, which main and renderer both import).
+  const getOutputConfig = (configName, isDev) => ({
     filename: "[name].js",
+    chunkFilename: `${configName}.[id].js`,
+    webassemblyModuleFilename: `${configName}.[hash].module.wasm`,
     path: params.outputPath,
     ...(isDev && { devtoolModuleFilenameTemplate: "[absolute-resource-path]" }),
   });
@@ -112,7 +118,7 @@ module.exports.buildConfig = function buildConfig(params) {
     optimization: {
       minimize: false,
     },
-    output: getOutputConfig(NODE_ENV === "development"),
+    output: getOutputConfig("main", NODE_ENV === "development"),
     devtool: NODE_ENV === "development" ? "cheap-source-map" : false,
     module: {
       rules: [
@@ -208,7 +214,7 @@ module.exports.buildConfig = function buildConfig(params) {
     optimization: {
       minimize: false,
     },
-    output: getOutputConfig(NODE_ENV === "development"),
+    output: getOutputConfig("preload", NODE_ENV === "development"),
     devtool: NODE_ENV === "development" ? "cheap-source-map" : false,
     module: {
       rules: [
