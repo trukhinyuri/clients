@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
 import * as path from "path";
 
-import { app, BrowserWindow, ipcMain, session } from "electron";
+import { app, BrowserWindow, ipcMain, screen, session } from "electron";
 import { mock, MockProxy } from "jest-mock-extended";
 import { NEVER, of } from "rxjs";
 
@@ -394,6 +394,242 @@ describe("WindowMain", () => {
       await sut.toggleAlwaysOnTop();
 
       expect(desktopSettingsService.setAlwaysOnTop).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("getWindowState", () => {
+    const originalPlatform = process.platform;
+    const defaultWidth = 1000;
+    const defaultHeight = 700;
+
+    // The two outputs from the issue, side by side; the smaller one is the primary.
+    const firstDisplay = { x: 0, y: 0, width: 1920, height: 1280 };
+    const largerDisplay = { x: 1920, y: 0, width: 3072, height: 1728 };
+
+    let sut: WindowMain;
+    let desktopSettingsService: MockProxy<DesktopSettingsService>;
+    let ozonePlatform: string;
+
+    const setPlatform = (platform: NodeJS.Platform) => {
+      Object.defineProperty(process, "platform", { value: platform, configurable: true });
+    };
+
+    const setDisplays = (...displays: Electron.Rectangle[]) => {
+      const intersectionArea = (a: Electron.Rectangle, b: Electron.Rectangle) =>
+        Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) *
+        Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+
+      Object.assign(screen, {
+        getAllDisplays: () => displays.map((bounds) => ({ bounds })),
+        getPrimaryDisplay: () => ({ bounds: displays[0] }),
+        getDisplayMatching: (rect: Electron.Rectangle) => ({
+          bounds: displays.reduce((best, bounds) =>
+            intersectionArea(bounds, rect) > intersectionArea(best, rect) ? bounds : best,
+          ),
+        }),
+      });
+    };
+
+    const getWindowState = (savedState: object) => {
+      Object.assign(desktopSettingsService, { window$: of(savedState) });
+      return (sut as any).getWindowState(defaultWidth, defaultHeight);
+    };
+
+    beforeEach(() => {
+      desktopSettingsService = mock<DesktopSettingsService>();
+      sut = new WindowMain(
+        mock<BiometricStateService>(),
+        mock<LogService>(),
+        mock<AbstractStorageService>(),
+        desktopSettingsService,
+        mock<SafeShell>(),
+        null,
+        () => {},
+        null,
+      );
+
+      setPlatform("linux");
+      ozonePlatform = "x11";
+      Object.assign(app, {
+        commandLine: {
+          getSwitchValue: (name: string) => (name === "ozone-platform" ? ozonePlatform : ""),
+        },
+      });
+      setDisplays(firstDisplay, largerDisplay);
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    });
+
+    describe("on native Wayland", () => {
+      beforeEach(() => {
+        ozonePlatform = "wayland";
+      });
+
+      // Wayland does not tell the app where its window is, so the saved position is 0,0 and the
+      // saved display is the first output, whichever output the window was used on.
+      it("does not maximize a window used on an output larger than the first one", async () => {
+        const state = await getWindowState({
+          width: 2914,
+          height: 1606,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(false);
+        expect(state.width).toBe(2914);
+        expect(state.height).toBe(1606);
+      });
+
+      it("fits the width to the largest display rather than to the saved one", async () => {
+        const state = await getWindowState({
+          width: 4000,
+          height: 1000,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(false);
+        expect(state.width).toBe(largerDisplay.width - 10);
+        expect(state.height).toBe(1000);
+      });
+
+      it("keeps the size of a window that fits a display of another orientation", async () => {
+        // Same area, so the largest display alone would pick the landscape primary.
+        setDisplays(
+          { x: 0, y: 0, width: 1920, height: 1080 },
+          { x: 1920, y: 0, width: 1080, height: 1920 },
+        );
+
+        const state = await getWindowState({
+          width: 1000,
+          height: 1600,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: { x: 0, y: 0, width: 1920, height: 1080 },
+        });
+
+        expect(state.isMaximized).toBe(false);
+        expect(state.width).toBe(1000);
+        expect(state.height).toBe(1600);
+      });
+
+      it("clamps a window that is larger than every display instead of maximizing it", async () => {
+        const state = await getWindowState({
+          width: 4000,
+          height: 2000,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(false);
+        expect(state.width).toBe(largerDisplay.width - 10);
+        expect(state.height).toBe(largerDisplay.height - 10);
+      });
+
+      // The compositor can announce outputs after the app reads the display list at start.
+      it("does not maximize when the output the window was used on is not known yet", async () => {
+        setDisplays(firstDisplay);
+
+        const state = await getWindowState({
+          width: 2914,
+          height: 1606,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(false);
+        expect(state.width).toBe(firstDisplay.width - 10);
+        expect(state.height).toBe(firstDisplay.height - 10);
+      });
+
+      it("keeps a saved maximized state", async () => {
+        const state = await getWindowState({
+          width: 1000,
+          height: 700,
+          x: 0,
+          y: 0,
+          isMaximized: true,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(true);
+      });
+    });
+
+    describe("where the window position is known", () => {
+      it("maximizes a window larger than the display it was on", async () => {
+        const state = await getWindowState({
+          width: 2914,
+          height: 1606,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(true);
+        expect(state.width).toBe(firstDisplay.width - 10);
+        expect(state.height).toBe(firstDisplay.height - 10);
+      });
+
+      it("keeps the size and position of a window that fits the display it was on", async () => {
+        const state = await getWindowState({
+          width: 2914,
+          height: 1606,
+          x: 2000,
+          y: 50,
+          isMaximized: false,
+          displayBounds: largerDisplay,
+        });
+
+        expect(state).toMatchObject({
+          isMaximized: false,
+          width: 2914,
+          height: 1606,
+          x: 2000,
+          y: 50,
+        });
+      });
+
+      it("centers the window on the primary display when its display is gone", async () => {
+        const state = await getWindowState({
+          width: 1000,
+          height: 700,
+          x: 6000,
+          y: 50,
+          isMaximized: false,
+          displayBounds: { x: 5000, y: 0, width: 2560, height: 1440 },
+        });
+
+        expect(state).toMatchObject({ isMaximized: false, x: 460, y: 290 });
+      });
+
+      it("does not treat Wayland as the Ozone platform outside Linux", async () => {
+        setPlatform("win32");
+        ozonePlatform = "wayland";
+
+        const state = await getWindowState({
+          width: 2914,
+          height: 1606,
+          x: 0,
+          y: 0,
+          isMaximized: false,
+          displayBounds: firstDisplay,
+        });
+
+        expect(state.isMaximized).toBe(true);
+      });
     });
   });
 });

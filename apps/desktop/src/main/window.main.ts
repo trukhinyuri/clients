@@ -735,11 +735,27 @@ export class WindowMain {
 
     const isValid = state != null && (this.stateHasBounds(state) || state.isMaximized);
     let displayBounds: Electron.Rectangle = null;
+    let maximizeWhenLarger = true;
     if (!isValid) {
       state.width = defaultWidth;
       state.height = defaultHeight;
 
       displayBounds = screen.getPrimaryDisplay().bounds;
+    } else if (this.stateHasBounds(state) && this.windowPositionUnknown()) {
+      // The saved position and display were derived from a position the app could not know, so
+      // the window may have been on any display. Use a display the saved size fits on, otherwise
+      // fit it to the largest one. Right after start the compositor may not have announced every
+      // output yet, so a window larger than the known displays is only clamped: maximizing it
+      // would be saved and repeated on every start.
+      const allBounds = screen.getAllDisplays().map((display) => display.bounds);
+      displayBounds =
+        allBounds.find((bounds) => state.width <= bounds.width && state.height <= bounds.height) ??
+        allBounds.reduce(
+          (largest, bounds) =>
+            bounds.width * bounds.height > largest.width * largest.height ? bounds : largest,
+          screen.getPrimaryDisplay().bounds,
+        );
+      maximizeWhenLarger = false;
     } else if (this.stateHasBounds(state) && state.displayBounds) {
       // Check if the display where the window was last open is still available
       displayBounds = screen.getDisplayMatching(state.displayBounds).bounds;
@@ -757,7 +773,11 @@ export class WindowMain {
     }
 
     if (displayBounds != null) {
-      if (state.width > displayBounds.width && state.height > displayBounds.height) {
+      if (
+        maximizeWhenLarger &&
+        state.width > displayBounds.width &&
+        state.height > displayBounds.height
+      ) {
         state.isMaximized = true;
       }
 
@@ -770,6 +790,16 @@ export class WindowMain {
     }
 
     return state;
+  }
+
+  /**
+   * A native Wayland client is not told where the compositor placed its window, so
+   * `win.getBounds()` reports a made-up origin and the display matched from it is not
+   * necessarily the one the window is on. Chromium records the Ozone platform it runs on as the
+   * `--ozone-platform` switch of the browser process, also when it chose the platform itself.
+   */
+  private windowPositionUnknown(): boolean {
+    return isLinux() && app.commandLine.getSwitchValue("ozone-platform") === "wayland";
   }
 
   private stateHasBounds(state: any): boolean {
