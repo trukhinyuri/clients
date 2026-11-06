@@ -257,7 +257,9 @@ export class HelpMenu implements IMenubarMenu {
           if (!isMacAppStore()) {
             app.relaunch();
           }
-          app.exit();
+          // Quit rather than exit: storage writes the setting to disk on `will-quit`, which
+          // `app.exit` skips.
+          app.quit();
         },
       },
       {
