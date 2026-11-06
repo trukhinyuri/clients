@@ -279,9 +279,11 @@ describe("WindowMain", () => {
           on: jest.fn(),
           send: jest.fn(),
           setWindowOpenHandler: jest.fn(),
+          invalidate: jest.fn(),
           userAgent: "",
         },
         isDestroyed: jest.fn().mockReturnValue(false),
+        isVisible: jest.fn().mockReturnValue(true),
         loadURL: jest.fn().mockResolvedValue(undefined),
         show: jest.fn(),
         setContentProtection: jest.fn(),
@@ -357,6 +359,60 @@ describe("WindowMain", () => {
       win.emit("closed");
 
       expect(sut.win).toBeNull();
+    });
+
+    describe("when the window is shown", () => {
+      const originalPlatform = process.platform;
+      let win: ReturnType<typeof fakeWindow>;
+
+      const setPlatform = (platform: NodeJS.Platform) =>
+        Object.defineProperty(process, "platform", { value: platform, configurable: true });
+
+      beforeEach(async () => {
+        win = fakeWindow();
+        jest.mocked(BrowserWindow).mockImplementationOnce(() => win as any);
+        await sut.createWindow();
+        jest.useFakeTimers();
+      });
+
+      afterEach(() => {
+        jest.useRealTimers();
+        setPlatform(originalPlatform);
+      });
+
+      // bitwarden/clients#23899: a repaint unblocks Chromium's Wayland configure ack.
+      it("repaints the window on Linux", () => {
+        setPlatform("linux");
+
+        win.emit("show");
+
+        expect(win.webContents.invalidate).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(100);
+        expect(win.webContents.invalidate).toHaveBeenCalledTimes(1);
+        jest.advanceTimersByTime(1400);
+        expect(win.webContents.invalidate).toHaveBeenCalledTimes(3);
+      });
+
+      it("does not repaint a window that was hidden or destroyed in the meantime", () => {
+        setPlatform("linux");
+
+        win.emit("show");
+        win.isVisible.mockReturnValue(false);
+        jest.advanceTimersByTime(100);
+        win.isDestroyed.mockReturnValue(true);
+        jest.advanceTimersByTime(1400);
+
+        expect(win.webContents.invalidate).not.toHaveBeenCalled();
+      });
+
+      it.each<NodeJS.Platform>(["darwin", "win32"])("does not repaint on %s", (platform) => {
+        setPlatform(platform);
+
+        win.emit("show");
+        jest.advanceTimersByTime(1500);
+
+        expect(win.webContents.invalidate).not.toHaveBeenCalled();
+      });
     });
   });
 
