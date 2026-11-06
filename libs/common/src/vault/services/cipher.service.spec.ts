@@ -1,5 +1,14 @@
 import { mock } from "jest-mock-extended";
-import { BehaviorSubject, Observable, filter, firstValueFrom, map, of, throwError } from "rxjs";
+import {
+  BehaviorSubject,
+  Observable,
+  Subject,
+  filter,
+  firstValueFrom,
+  map,
+  of,
+  throwError,
+} from "rxjs";
 
 // This import has been flagged as unallowed for this class. It may be involved in a circular dependency loop.
 // eslint-disable-next-line no-restricted-imports
@@ -14,7 +23,11 @@ import {
 } from "@bitwarden/legacy-crypto";
 import { Measurement } from "@bitwarden/logging";
 import { MessageSender } from "@bitwarden/messaging";
-import { CipherListView } from "@bitwarden/sdk-internal";
+import {
+  Cipher as SdkCipher,
+  CipherListView,
+  PasswordManagerClient,
+} from "@bitwarden/sdk-internal";
 
 import { FakeAccountService, mockAccountServiceWith } from "../../../spec/fake-account-service";
 import { FakeStateProvider } from "../../../spec/fake-state-provider";
@@ -26,7 +39,9 @@ import { UriMatchStrategy } from "../../models/domain/domain-service";
 import { ConfigService } from "../../platform/abstractions/config/config.service";
 import { I18nService } from "../../platform/abstractions/i18n.service";
 import { LogService } from "../../platform/abstractions/log.service";
+import { SdkService } from "../../platform/abstractions/sdk/sdk.service";
 import { FileUploadType } from "../../platform/enums";
+import { Rc } from "../../platform/misc/reference-counting/rc";
 import { Utils } from "../../platform/misc/utils";
 import { ContainerService } from "../../platform/services/container.service";
 import { CipherId, UserId, OrganizationId, CollectionId } from "../../types/guid";
@@ -47,7 +62,12 @@ import { LoginUriView } from "../models/view/login-uri.view";
 import { LoginView } from "../models/view/login.view";
 
 import { CipherService } from "./cipher.service";
-import { DECRYPTED_CIPHERS, ENCRYPTED_CIPHERS } from "./key-state/ciphers.state";
+import { DefaultCipherEncryptionService } from "./default-cipher-encryption.service";
+import {
+  DECRYPTED_CIPHERS,
+  ENCRYPTED_CIPHERS,
+  FAILED_DECRYPTED_CIPHERS,
+} from "./key-state/ciphers.state";
 
 const ENCRYPTED_TEXT = "This data has been encrypted";
 function encryptText(clearText: string | Uint8Array) {
@@ -653,6 +673,315 @@ describe("Cipher Service", () => {
         );
 
         expect(result).toEqual([normalListView, partialListView]);
+      });
+    });
+
+    describe("yielded batch cancellation on lock, cache clear, and superseding sync", () => {
+      let testUserId: UserId;
+      let keys$: BehaviorSubject<CipherDecryptionKeys | null>;
+      let mockSdkClient: {
+        free: jest.Mock;
+        vault: jest.Mock;
+      };
+      let decryptListWithFailures: jest.Mock;
+      let rc: Rc<PasswordManagerClient>;
+      let sdkService: SdkService;
+
+      function makeEncryptedState(count: number, prefix = "cipher"): Record<CipherId, CipherData> {
+        const state: Record<CipherId, CipherData> = {};
+        for (let i = 0; i < count; i++) {
+          const id = `${prefix}-${i}` as CipherId;
+          state[id] = {
+            ...cipherData,
+            id,
+            organizationId: null,
+          };
+        }
+        return state;
+      }
+
+      beforeEach(() => {
+        testUserId = Utils.newGuid() as UserId;
+        jest.spyOn(Cipher.prototype, "toSdkCipher").mockImplementation(function (this: Cipher) {
+          return { id: this.id } as unknown as SdkCipher;
+        });
+        jest.spyOn(Cipher, "fromSdkCipher").mockImplementation((sdkCipher: SdkCipher) => {
+          return new Cipher({
+            ...cipherData,
+            id: sdkCipher.id as unknown as CipherId,
+            organizationId: null,
+          });
+        });
+
+        keys$ = new BehaviorSubject<CipherDecryptionKeys | null>({} as CipherDecryptionKeys);
+        keyService.cipherDecryptionKeys$.mockImplementation(() => keys$.asObservable());
+
+        decryptListWithFailures = jest.fn();
+        mockSdkClient = {
+          free: jest.fn(),
+          vault: jest.fn().mockReturnValue({
+            ciphers: jest.fn().mockReturnValue({
+              decrypt_list_with_failures: decryptListWithFailures,
+            }),
+          }),
+        };
+        rc = new Rc(mockSdkClient as unknown as PasswordManagerClient);
+        sdkService = mock<SdkService>({
+          userClient$: jest.fn(() => of(rc)),
+        });
+        const realEncryptionService = new DefaultCipherEncryptionService(sdkService, logService);
+        cipherEncryptionService.decryptManyWithFailures.mockImplementation((ciphers, uid, signal) =>
+          realEncryptionService.decryptManyWithFailures(ciphers, uid, signal),
+        );
+      });
+
+      it("cancels in-flight batches on lock (process reload skipped), frees the SDK client, and emits no late plaintext or FAILED_DECRYPTED_CIPHERS", async () => {
+        stateProvider.singleUser
+          .getFake(testUserId, ENCRYPTED_CIPHERS)
+          .nextState(makeEncryptedState(600));
+
+        const listEmissions: (CipherListView[] | CipherView[] | null)[] = [];
+        const restrictedEmissions: (CipherListView[] | CipherView[] | null)[] = [];
+        let capturedSignal: AbortSignal | undefined;
+
+        decryptListWithFailures.mockImplementation(async (batch: SdkCipher[]) => {
+          capturedSignal = cipherEncryptionService.decryptManyWithFailures.mock.calls[0]?.[2];
+          setTimeout(() => {
+            // Simulate LockService.lockUser when reloadProcess() is skipped:
+            // SDK client is marked for disposal, decrypted caches are cleared, and keys become null.
+            rc.markForDisposal();
+            expect(mockSdkClient.free).not.toHaveBeenCalled();
+            void cipherService.clearCache(testUserId);
+            keys$.next(null);
+          }, 0);
+          return {
+            successes: batch.map(
+              (c) =>
+                ({
+                  id: c.id,
+                  name: `Plaintext ${c.id}`,
+                  partial: false,
+                }) as unknown as CipherListView,
+            ),
+            failures: [batch[0]],
+          };
+        });
+
+        const sub1 = cipherService
+          .cipherListViews$(testUserId)
+          .subscribe((views) => listEmissions.push(views));
+        const sub2 = cipherService
+          .cipherListViewsIncludingRestricted$(testUserId)
+          .subscribe((views) => restrictedEmissions.push(views));
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        sub1.unsubscribe();
+        sub2.unsubscribe();
+
+        expect(capturedSignal).toBeDefined();
+        expect(capturedSignal?.aborted).toBe(true);
+        expect(decryptListWithFailures).toHaveBeenCalledTimes(1);
+        expect(mockSdkClient.free).toHaveBeenCalledTimes(1);
+        expect(restrictedEmissions).toEqual([null]);
+        expect(listEmissions.every((views) => views === null)).toBe(true);
+        expect(
+          await firstValueFrom(
+            stateProvider.singleUser.getFake(testUserId, FAILED_DECRYPTED_CIPHERS).state$,
+          ),
+        ).toBeNull();
+      });
+
+      it("cancels in-flight batches and frees the SDK client when keys become null mid-decrypt even before clearCache", async () => {
+        stateProvider.singleUser
+          .getFake(testUserId, ENCRYPTED_CIPHERS)
+          .nextState(makeEncryptedState(600));
+
+        const restrictedEmissions: (CipherListView[] | CipherView[] | null)[] = [];
+        const setFailedSpy = jest.spyOn(cipherService, "setFailedDecryptedCiphers");
+
+        decryptListWithFailures.mockImplementation(async (batch: SdkCipher[]) => {
+          setTimeout(() => {
+            rc.markForDisposal();
+            keys$.next(null);
+          }, 0);
+          return {
+            successes: batch.map(
+              (c) =>
+                ({
+                  id: c.id,
+                  name: `Plaintext ${c.id}`,
+                  partial: false,
+                }) as unknown as CipherListView,
+            ),
+            failures: [batch[0]],
+          };
+        });
+
+        const sub = cipherService
+          .cipherListViewsIncludingRestricted$(testUserId)
+          .subscribe((views) => restrictedEmissions.push(views));
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        sub.unsubscribe();
+
+        expect(decryptListWithFailures).toHaveBeenCalledTimes(1);
+        expect(mockSdkClient.free).toHaveBeenCalledTimes(1);
+        expect(restrictedEmissions).toEqual([]);
+        expect(setFailedSpy).not.toHaveBeenCalled();
+      });
+
+      it("cancels in-flight batches on clearCache (for userId or null) without cancelling other users", async () => {
+        const otherUserId = Utils.newGuid() as UserId;
+        stateProvider.singleUser
+          .getFake(testUserId, ENCRYPTED_CIPHERS)
+          .nextState(makeEncryptedState(600));
+
+        const restrictedEmissions: (CipherListView[] | CipherView[] | null)[] = [];
+        let batchCount = 0;
+        decryptListWithFailures.mockImplementation(async (batch: SdkCipher[]) => {
+          const currentBatch = batchCount++;
+          if (currentBatch === 0) {
+            setTimeout(() => {
+              // Clearing a different user's cache must not abort testUserId's decrypt.
+              void cipherService.clearCache(otherUserId);
+            }, 0);
+          } else if (currentBatch === 1) {
+            setTimeout(() => {
+              void cipherService.clearCache(testUserId);
+            }, 0);
+          }
+          return {
+            successes: batch.map(
+              (c) =>
+                ({
+                  id: c.id,
+                  name: `Plaintext ${c.id}`,
+                  partial: false,
+                }) as unknown as CipherListView,
+            ),
+            failures: [batch[0]],
+          };
+        });
+
+        const sub = cipherService
+          .cipherListViewsIncludingRestricted$(testUserId)
+          .subscribe((views) => restrictedEmissions.push(views));
+
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        // Batch 0 survived otherUserId clear; Batch 1 was aborted before Batch 2 ran.
+        expect(decryptListWithFailures).toHaveBeenCalledTimes(2);
+        expect(restrictedEmissions).toEqual([null]);
+        expect(
+          await firstValueFrom(
+            stateProvider.singleUser.getFake(testUserId, FAILED_DECRYPTED_CIPHERS).state$,
+          ),
+        ).toBeNull();
+
+        // Now trigger a fresh emission and abort via null (all-users clear) after Batch 0.
+        decryptListWithFailures.mockClear();
+        decryptListWithFailures.mockImplementation(async (batch: SdkCipher[]) => {
+          setTimeout(() => {
+            const clearSubject: unknown = Reflect.get(cipherService, "clearCipherViewsForUser$");
+            if (clearSubject instanceof Subject) {
+              clearSubject.next(null);
+            }
+          }, 0);
+          return {
+            successes: batch.map(
+              (c) =>
+                ({
+                  id: c.id,
+                  name: `Plaintext ${c.id}`,
+                  partial: false,
+                }) as unknown as CipherListView,
+            ),
+            failures: [batch[0]],
+          };
+        });
+
+        stateProvider.singleUser
+          .getFake(testUserId, ENCRYPTED_CIPHERS)
+          .nextState(makeEncryptedState(600, "second"));
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        sub.unsubscribe();
+
+        expect(decryptListWithFailures).toHaveBeenCalledTimes(1);
+        expect(restrictedEmissions).toEqual([null, null]);
+      });
+
+      it("aborts an older sync's decrypt loop when a superseding sync arrives between batches and only publishes the newer sync", async () => {
+        const encryptedFake = stateProvider.singleUser.getFake(testUserId, ENCRYPTED_CIPHERS);
+        encryptedFake.nextState(makeEncryptedState(600, "sync1"));
+
+        const emissions: (CipherListView[] | CipherView[] | null)[] = [];
+        const batchFirstIds: string[] = [];
+
+        decryptListWithFailures.mockImplementation(async (batch: SdkCipher[]) => {
+          const firstId = String(batch[0].id);
+          batchFirstIds.push(firstId);
+          if (firstId === "sync1-0") {
+            setTimeout(() => {
+              encryptedFake.nextState(makeEncryptedState(300, "sync2"));
+            }, 0);
+            return {
+              successes: batch.map(
+                (c) =>
+                  ({
+                    id: c.id,
+                    name: `Stale ${c.id}`,
+                    partial: false,
+                  }) as unknown as CipherListView,
+              ),
+              failures: [batch[0]],
+            };
+          }
+          return {
+            successes: batch.map(
+              (c) =>
+                ({
+                  id: c.id,
+                  name: `Fresh ${c.id}`,
+                  partial: false,
+                }) as unknown as CipherListView,
+            ),
+            failures: [] as SdkCipher[],
+          };
+        });
+
+        const sub = cipherService
+          .cipherListViews$(testUserId)
+          .subscribe((views) => emissions.push(views));
+
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        sub.unsubscribe();
+
+        // sync1 ran only batch 0 (sync1-0), never sync1-250 or sync1-500; sync2 ran both its batches.
+        expect(batchFirstIds).toEqual(["sync1-0", "sync2-0", "sync2-250"]);
+        expect(emissions).toHaveLength(1);
+        expect(emissions[0]).toHaveLength(300);
+        expect(emissions[0]?.every((c) => c.name.startsWith("Fresh sync2-"))).toBe(true);
+        expect(
+          await firstValueFrom(
+            stateProvider.singleUser.getFake(testUserId, FAILED_DECRYPTED_CIPHERS).state$,
+          ),
+        ).toEqual([]);
+      });
+
+      it("propagates non-abort decryption errors when the run was not cancelled", async () => {
+        stateProvider.singleUser
+          .getFake(testUserId, ENCRYPTED_CIPHERS)
+          .nextState(makeEncryptedState(300, "err"));
+
+        const wasmError = new Error("WASM decryption failure");
+        decryptListWithFailures
+          .mockResolvedValueOnce({ successes: [], failures: [] })
+          .mockRejectedValueOnce(wasmError);
+
+        await expect(
+          firstValueFrom(cipherService.cipherListViewsIncludingRestricted$(testUserId)),
+        ).rejects.toThrow(wasmError);
       });
     });
 

@@ -1,14 +1,20 @@
 // FIXME: Update this file to be type safe and remove this and next line
 // @ts-strict-ignore
 import {
+  catchError,
   combineLatest,
+  defer,
+  EMPTY,
   filter,
+  finalize,
   firstValueFrom,
   map,
   Observable,
   Subject,
   switchMap,
+  takeUntil,
   tap,
+  throwError,
 } from "rxjs";
 
 // This import has been flagged as unallowed for this class. It may be involved in a circular dependency loop.
@@ -16,7 +22,7 @@ import {
 import { KeyService } from "@bitwarden/key-management";
 // eslint-disable-next-line no-restricted-imports
 import { EncArrayBuffer, EncryptService, LegacyCompatKeyService } from "@bitwarden/legacy-crypto";
-import { Measurement, PerfTrackGroup } from "@bitwarden/logging";
+import { PerfTrackGroup } from "@bitwarden/logging";
 import { CipherListView } from "@bitwarden/sdk-internal";
 
 import { ApiService } from "../../abstractions/api.service";
@@ -81,7 +87,7 @@ export class CipherService implements CipherServiceAbstraction {
    * clear them from the shareReplay buffer created in perUserCache$().
    * @private
    */
-  private clearCipherViewsForUser$: Subject<UserId> = new Subject<UserId>();
+  private clearCipherViewsForUser$: Subject<UserId | null> = new Subject<UserId | null>();
 
   constructor(
     private keyService: KeyService,
@@ -155,35 +161,45 @@ export class CipherService implements CipherServiceAbstraction {
    * everything else uses {@link cipherListViews$}.
    */
   cipherListViewsIncludingRestricted$ = perUserCache$((userId: UserId) => {
-    let decryptMeasurement: Measurement;
-
     return combineLatest([
       this.encryptedCiphersState(userId).state$,
       this.localData$(userId),
       this.keyService.cipherDecryptionKeys$(userId, true),
     ]).pipe(
-      filter(([cipherDataState, _, keys]) => cipherDataState != null && keys != null),
-      map(([cipherDataState, localData]) =>
-        Object.values(cipherDataState).map(
+      switchMap(([cipherDataState, localData, keys]) => {
+        if (cipherDataState == null || keys == null) {
+          return EMPTY;
+        }
+
+        const ciphers = Object.values(cipherDataState).map(
           (cipherData) => new Cipher(cipherData, localData?.[cipherData.id as CipherId]),
-        ),
-      ),
-      tap(() => {
-        decryptMeasurement = this.logService.startMeasurement(
+        );
+        const decryptMeasurement = this.logService.startMeasurement(
           PERF_TRACK_GROUP,
           PERF_TRACK,
           "listViewDecrypt",
         );
-      }),
-      switchMap(async (ciphers) => {
-        return await this.decryptCiphersWithSdk(ciphers, userId);
-      }),
-      tap(([decrypted, failures]) => {
-        void Promise.all([this.setFailedDecryptedCiphers(failures, userId)]);
+        const controller = new AbortController();
 
-        decryptMeasurement.finish([["Items", decrypted.length]]);
+        return defer(() => this.decryptCiphersWithSdk(ciphers, userId, controller.signal)).pipe(
+          filter(() => !controller.signal.aborted),
+          tap(([decrypted, failures]) => {
+            void Promise.all([this.setFailedDecryptedCiphers(failures, userId)]);
+
+            decryptMeasurement.finish([["Items", decrypted.length]]);
+          }),
+          map(([decrypted]) => decrypted),
+          catchError((error: unknown) =>
+            controller.signal.aborted ? EMPTY : throwError(() => error),
+          ),
+          takeUntil(
+            this.clearCipherViewsForUser$.pipe(
+              filter((clearId) => clearId === userId || clearId === null),
+            ),
+          ),
+          finalize(() => controller.abort()),
+        );
       }),
-      map(([decrypted]) => decrypted),
     );
   }, this.clearCipherViewsForUser$);
 
@@ -1740,9 +1756,12 @@ export class CipherService implements CipherServiceAbstraction {
   private async decryptCiphersWithSdk(
     ciphers: Cipher[],
     userId: UserId,
+    signal?: AbortSignal,
   ): Promise<[CipherListView[], CipherView[]]> {
+    signal?.throwIfAborted();
     // Fixes a bug causing decryption failures immediately after a user leaves an organization.
     const decryptableCiphers = await this.excludeCiphersMissingOrgKey(ciphers, userId);
+    signal?.throwIfAborted();
 
     // Short-circuit if there are no ciphers to decrypt
     // Observables reacting to key changes may attempt to decrypt with a stale SDK reference.
@@ -1750,10 +1769,15 @@ export class CipherService implements CipherServiceAbstraction {
       return [[], []];
     }
 
-    const [decrypted, failures] = await this.cipherEncryptionService.decryptManyWithFailures(
-      decryptableCiphers,
-      userId,
-    );
+    const [decrypted, failures] =
+      signal === undefined
+        ? await this.cipherEncryptionService.decryptManyWithFailures(decryptableCiphers, userId)
+        : await this.cipherEncryptionService.decryptManyWithFailures(
+            decryptableCiphers,
+            userId,
+            signal,
+          );
+    signal?.throwIfAborted();
 
     const failedViews = failures.map((c) => {
       const cipher_view = new CipherView(c);

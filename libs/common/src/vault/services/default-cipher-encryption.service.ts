@@ -1,4 +1,13 @@
-import { EMPTY, catchError, concatMap, firstValueFrom, map, throwError } from "rxjs";
+import {
+  EMPTY,
+  Observable,
+  catchError,
+  concatMap,
+  firstValueFrom,
+  map,
+  merge,
+  throwError,
+} from "rxjs";
 
 import { CipherListView, DecryptCipherListResult } from "@bitwarden/sdk-internal";
 
@@ -14,6 +23,38 @@ import { CipherView } from "../models/view/cipher.view";
 
 /** Ciphers per SDK decrypt call, which bounds the SDK's peak memory. */
 const DECRYPT_BATCH_SIZE = 250;
+
+/**
+ * Yields to the macrotask queue so pending input and rendering work can run
+ * between synchronous WASM decryption batches.
+ */
+function yieldToEventLoop(signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  const { scheduler } = globalThis as typeof globalThis & {
+    scheduler?: { yield?: () => Promise<void> };
+  };
+  const yieldPromise =
+    typeof scheduler?.yield === "function"
+      ? scheduler.yield()
+      : new Promise<void>((resolve) => setTimeout(resolve, 0));
+  if (signal == null) {
+    return yieldPromise;
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void yieldPromise.then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 export class DefaultCipherEncryptionService implements CipherEncryptionService {
   constructor(
@@ -193,34 +234,67 @@ export class DefaultCipherEncryptionService implements CipherEncryptionService {
   async decryptManyWithFailures(
     ciphers: Cipher[],
     userId: UserId,
+    signal?: AbortSignal,
   ): Promise<[CipherListView[], Cipher[]]> {
+    signal?.throwIfAborted();
+
+    let inBatchLoop = false;
+    const abortBeforeClient$ =
+      signal == null
+        ? EMPTY
+        : new Observable<never>((subscriber) => {
+            if (signal.aborted) {
+              subscriber.error(signal.reason);
+              return;
+            }
+            const onAbort = () => {
+              if (!inBatchLoop) {
+                subscriber.error(signal.reason);
+              }
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            return () => signal.removeEventListener("abort", onAbort);
+          });
+
     return firstValueFrom(
-      this.sdkService.userClient$(userId).pipe(
-        concatMap(async (sdk) => {
-          using ref = sdk.take();
+      merge(
+        abortBeforeClient$,
+        this.sdkService.userClient$(userId).pipe(
+          concatMap(async (sdk) => {
+            inBatchLoop = true;
+            signal?.throwIfAborted();
+            using ref = sdk.take();
 
-          // In batches: WebAssembly memory grows to the largest call and never shrinks. For
-          // example, decrypting a 12.000 item vault in one call permanently raises the SDK memory
-          // by 70MB.
-          const result: DecryptCipherListResult = { successes: [], failures: [] };
-          for (let start = 0; start < ciphers.length; start += DECRYPT_BATCH_SIZE) {
-            const batch = ciphers.slice(start, start + DECRYPT_BATCH_SIZE);
-            const batchResult = await ref.value
-              .vault()
-              .ciphers()
-              .decrypt_list_with_failures(batch.map((cipher) => cipher.toSdkCipher()));
+            // In batches: WebAssembly memory grows to the largest call and never shrinks. For
+            // example, decrypting a 12.000 item vault in one call permanently raises the SDK memory
+            // by 70MB.
+            const result: DecryptCipherListResult = { successes: [], failures: [] };
+            for (let start = 0; start < ciphers.length; start += DECRYPT_BATCH_SIZE) {
+              signal?.throwIfAborted();
+              if (start > 0) {
+                await yieldToEventLoop(signal);
+                signal?.throwIfAborted();
+              }
+              const batch = ciphers.slice(start, start + DECRYPT_BATCH_SIZE);
+              const batchResult = await ref.value
+                .vault()
+                .ciphers()
+                .decrypt_list_with_failures(batch.map((cipher) => cipher.toSdkCipher()));
+              signal?.throwIfAborted();
 
-            result.successes.push(...batchResult.successes);
-            result.failures.push(...batchResult.failures);
-          }
+              result.successes.push(...batchResult.successes);
+              result.failures.push(...batchResult.failures);
+            }
 
-          const decryptedCiphers = result.successes;
-          const failedCiphers: Cipher[] = result.failures
-            .map((cipher) => Cipher.fromSdkCipher(cipher))
-            .filter((cipher): cipher is Cipher => cipher !== undefined);
+            signal?.throwIfAborted();
+            const decryptedCiphers = result.successes;
+            const failedCiphers: Cipher[] = result.failures
+              .map((cipher) => Cipher.fromSdkCipher(cipher))
+              .filter((cipher): cipher is Cipher => cipher !== undefined);
 
-          return [decryptedCiphers, failedCiphers] as [CipherListView[], Cipher[]];
-        }),
+            return [decryptedCiphers, failedCiphers] as [CipherListView[], Cipher[]];
+          }),
+        ),
       ),
     );
   }
