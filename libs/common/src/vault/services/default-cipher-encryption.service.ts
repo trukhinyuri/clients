@@ -15,6 +15,20 @@ import { CipherView } from "../models/view/cipher.view";
 /** Ciphers per SDK decrypt call, which bounds the SDK's peak memory. */
 const DECRYPT_BATCH_SIZE = 250;
 
+/**
+ * Yields to the macrotask queue so pending input and rendering work can run
+ * between synchronous WASM decryption batches.
+ */
+function yieldToEventLoop(): Promise<void> {
+  const { scheduler } = globalThis as typeof globalThis & {
+    scheduler?: { yield?: () => Promise<void> };
+  };
+  if (typeof scheduler?.yield === "function") {
+    return scheduler.yield();
+  }
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export class DefaultCipherEncryptionService implements CipherEncryptionService {
   constructor(
     private sdkService: SdkService,
@@ -204,6 +218,9 @@ export class DefaultCipherEncryptionService implements CipherEncryptionService {
           // by 70MB.
           const result: DecryptCipherListResult = { successes: [], failures: [] };
           for (let start = 0; start < ciphers.length; start += DECRYPT_BATCH_SIZE) {
+            if (start > 0) {
+              await yieldToEventLoop();
+            }
             const batch = ciphers.slice(start, start + DECRYPT_BATCH_SIZE);
             const batchResult = await ref.value
               .vault()

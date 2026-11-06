@@ -581,6 +581,103 @@ describe("DefaultCipherEncryptionService", () => {
         .decrypt_list_with_failures.mock.calls.map(([batch]: [unknown[]]) => batch.length);
       expect(batches).toEqual([250, 250, 100]);
     });
+
+    it("yields to the macrotask queue between batches so queued tasks can run", async () => {
+      const ciphers = Array.from(
+        { length: 600 },
+        (_, i) => ({ toSdkCipher: () => ({ id: `${i}` }) }) as unknown as Cipher,
+      );
+      const events: string[] = [];
+      let batchIndex = 0;
+      mockSdkClient
+        .vault()
+        .ciphers()
+        .decrypt_list_with_failures.mockImplementation(async (batch: SdkCipher[]) => {
+          const current = batchIndex++;
+          events.push(`batch:${current}:${batch[0].id}`);
+          setTimeout(() => events.push(`macrotask:${current}`), 0);
+          return {
+            successes: batch.map((c) => ({ id: c.id }) as unknown as CipherListView),
+            failures: [] as SdkCipher[],
+          };
+        });
+
+      const [decrypted, failed] = await cipherEncryptionService.decryptManyWithFailures(
+        ciphers,
+        userId,
+      );
+
+      expect(events).toEqual([
+        "batch:0:0",
+        "macrotask:0",
+        "batch:1:250",
+        "macrotask:1",
+        "batch:2:500",
+      ]);
+      expect(decrypted.map((c) => c.id)).toEqual(Array.from({ length: 600 }, (_, i) => `${i}`));
+      expect(failed).toEqual([]);
+    });
+
+    it("uses scheduler.yield between batches when available and does not yield for a single batch", async () => {
+      const globalWithScheduler = globalThis as typeof globalThis & {
+        scheduler?: { yield?: () => Promise<void> };
+      };
+      const originalScheduler = globalWithScheduler.scheduler;
+      const yieldCalls: unknown[] = [];
+      const scheduler = {
+        yield: jest.fn(function (this: unknown) {
+          yieldCalls.push(this);
+          return Promise.resolve();
+        }),
+      };
+      globalWithScheduler.scheduler = scheduler;
+
+      try {
+        mockSdkClient
+          .vault()
+          .ciphers()
+          .decrypt_list_with_failures.mockResolvedValue({ successes: [], failures: [] });
+
+        const singleBatch = Array.from(
+          { length: 250 },
+          () => ({ toSdkCipher: () => ({}) }) as unknown as Cipher,
+        );
+        await cipherEncryptionService.decryptManyWithFailures(singleBatch, userId);
+        expect(scheduler.yield).not.toHaveBeenCalled();
+
+        const multiBatch = Array.from(
+          { length: 600 },
+          () => ({ toSdkCipher: () => ({}) }) as unknown as Cipher,
+        );
+        await cipherEncryptionService.decryptManyWithFailures(multiBatch, userId);
+        expect(scheduler.yield).toHaveBeenCalledTimes(2);
+        expect(yieldCalls).toEqual([scheduler, scheduler]);
+      } finally {
+        if (originalScheduler === undefined) {
+          delete globalWithScheduler.scheduler;
+        } else {
+          globalWithScheduler.scheduler = originalScheduler;
+        }
+      }
+    });
+
+    it("propagates errors from a later batch and disposes the SDK reference", async () => {
+      const ciphers = Array.from(
+        { length: 400 },
+        () => ({ toSdkCipher: () => ({}) }) as unknown as Cipher,
+      );
+      const batchError = new Error("WASM decrypt batch failed");
+      mockSdkClient
+        .vault()
+        .ciphers()
+        .decrypt_list_with_failures.mockResolvedValueOnce({ successes: [], failures: [] })
+        .mockRejectedValueOnce(batchError);
+
+      await expect(
+        cipherEncryptionService.decryptManyWithFailures(ciphers, userId),
+      ).rejects.toThrow(batchError);
+      expect(mockRef[Symbol.dispose]).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("decryptAttachmentContent", () => {
